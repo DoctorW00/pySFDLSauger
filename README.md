@@ -1,1 +1,1 @@
-pip install requests progressbar2 pysocks cryptography lxml pathlib2
+pip install progressbar2 requests cryptography PySocks urllib3
