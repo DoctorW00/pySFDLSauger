@@ -1,1 +1,1 @@
-pip install progressbar2 requests cryptography PySocks urllib3
+pip install tqdm requests cryptography PySocks urllib3
