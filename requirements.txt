@@ -1,4 +1,4 @@
-progressbar2
+tqdm
 requests
 cryptography
 PySocks
