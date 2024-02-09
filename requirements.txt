@@ -1,5 +1,7 @@
 tqdm
 requests
 cryptography
-PySocks
 urllib3
+socks
+sockshandler
+watchdog

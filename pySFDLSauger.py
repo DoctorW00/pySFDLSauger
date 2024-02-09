@@ -1,4 +1,4 @@
-import sys, os, argparse, threading, time, socks, re, requests, tempfile, base64, hashlib, tqdm
+import sys, os, argparse, threading, time, socks, re, requests, tempfile, base64, hashlib, tqdm, subprocess, shutil
 from pathlib import Path
 from socket import error as socket_error
 from ftplib import FTP, error_temp, error_perm, error_proto, error_reply, Error
@@ -7,6 +7,14 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 from math import log2
 import xml.etree.ElementTree as ET
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+__version__ = "2.0.7"
+__printdebug__ = False
+__required_packages__ = ['tqdm', 'requests', 'cryptography', 'socks', 'sockshandler', 'urllib3', 'watchdog']
+__download_running__ = False
+__monitor_mode__ = False
 
 class Proxy:
     def __init__(self, host, port, username=None, password=None):
@@ -50,6 +58,7 @@ class FTPList:
             return None
 
     def ftp_login(self):
+        __download_running__ = True
         try:
             self.ftp = FTP()
             if self.proxy is not None:
@@ -129,14 +138,15 @@ class FTPList:
                 self.ftp.quit()
                 if self.proxy is not None:
                     self.proxy.close()
-                # print(f"FTPList: FTP Connection Closed!")
+                if __printdebug__: print(f"FTPList: FTP Connection Closed!")
+                __download_running__ = False
             except AttributeError:
                 pass
             finally:
                 self.ftp = None
 
 class FTPDownloader:
-    def __init__(self, ftp_host, ftp_port=21, ftp_user="anonymous", ftp_pass="anonymous@sauger.local", download_folder=None, max_threads=10, release_name=None, proxy=None):
+    def __init__(self, ftp_host, ftp_port=21, ftp_user="anonymous", ftp_pass="anonymous@sauger.local", download_folder=None, max_threads=10, release_name=None, proxy=None, sfdl_file=None):
         self.ftp_sessions = {}
         self.ftp_lock = threading.Lock()
         self.ftp_host = ftp_host
@@ -148,14 +158,26 @@ class FTPDownloader:
         self.thread_semaphore = threading.Semaphore(self.max_threads)
         self.release_name = release_name
         self.proxy = proxy
+        self.sfdl_file = sfdl_file
         self.bar = None # main progress for the whole download
         self.bars = []  # progressbars for files
         self.bars_count = 0
+        self.start_time = 0
+        self.done_time = 0
+        self.b2h = bytes2human
 
     def ensure_directory_exists(self, file_path):
         directory = os.path.dirname(file_path)
         if not os.path.exists(directory):
             os.makedirs(directory)
+
+    def move_file(self, file_path, destination_path):
+        try:
+            dest_path = os.path.normpath(destination_path + "/" + self.release_name)
+            print(f" \033[93;1mMoving:\033[0m \033[92;1m{file_path}\033[0m \033[93;1mto\033[0m \033[92;1m{dest_path}\033[0m")
+            shutil.move(file_path, dest_path)
+        except Exception as e:
+            print(f" \033[91;1mError: Can't move SFDL to download folder: {e}\033[0m")
 
     def get_release_from_path(self, path):
         release = None
@@ -167,6 +189,56 @@ class FTPDownloader:
                 release = path[new_last_slash_index + 1:]
         return release
     
+    def return_local_file_path(self, local_filepath, remote_path):
+        if self.download_folder is None:
+            local_filepath = os.path.join(self.download_folder, local_filepath)
+        else:
+            local_filepath = self.download_folder
+        
+        release = None
+        if self.release_name is not None:
+            release = self.release_name
+        else:
+            release = self.get_release_from_path(remote_path)
+        
+        index = remote_path.find(release)
+        
+        subdir = None
+        if index != -1:
+            subdir = remote_path[index + len(release):]
+            local_filepath = local_filepath + "/" + release + "/" + subdir
+        else:
+            local_filepath = local_filepath + "/" + release
+        return local_filepath.replace("//", "/")
+    
+    def calculate_download_speed(self, file_size, elapsed_time_seconds):
+        speed_bytes_per_sec = file_size / elapsed_time_seconds
+        ergebnis = self.b2h(speed_bytes_per_sec, 1000)
+        return ergebnis
+    
+    def seconds_to_readable_time(self, seconds):
+        minutes, seconds = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        days, hours = divmod(hours, 24)
+        time_parts = []
+        if days == 1:
+            time_parts.append("1 Day")
+        elif days > 1:
+            time_parts.append(f"{int(days)} Days")
+        if hours == 1:
+            time_parts.append("1 Hour")
+        elif hours > 1:
+            time_parts.append(f"{int(hours)} Hours")
+        if minutes == 1:
+            time_parts.append("1 Minute")
+        elif minutes > 1:
+            time_parts.append(f"{int(minutes)} Minutes")
+        if seconds == 1:
+            time_parts.append("1 Second")
+        elif seconds > 1 or not time_parts:
+            time_parts.append(f"{int(seconds)} Seconds")
+        return ", ".join(time_parts)
+
     def connect(self):
         with self.ftp_lock:
             try:
@@ -199,17 +271,20 @@ class FTPDownloader:
                     self.ftp_sessions[current_thread] = new_session
             return self.ftp_sessions[current_thread]
         except (error_temp, error_perm, error_proto, error_reply, Error, socket_error) as e:
-            print(f" \033[91;1m[1] FTP Connection Error in get_ftp_session: {e}\033[0m")
+            if __printdebug__: print(f" \033[91;1m[1] FTP Connection Error in get_ftp_session: {e}\033[0m")
             return None
         except EOFError as eof_error:
-            print(f" \033[91;1m[1] EOFError in get_ftp_session: {eof_error}\033[0m")
+            if __printdebug__: print(f" \033[91;1m[1] EOFError in get_ftp_session: {eof_error}\033[0m")
             return None
     
     def download_multiple_files(self, file_list):
+        __download_running__ = True
+        self.start_time = time.time()
+        
         total_size = sum(file_size for _, file_size in file_list)
         total_files = len(file_list)
         
-        self.bar = tqdm.tqdm(total=total_size, unit_scale=True, desc=f' \033[91;1m{self.release_name}\033[0m', miniters=1, file=sys.stdout, leave=True, colour="green")
+        self.bar = tqdm.tqdm(total=total_size, unit_scale=True, dynamic_ncols=True, desc=f' \033[91;1m{self.release_name}\033[0m', miniters=1, file=sys.stdout, leave=True, colour="green")
 
         threads = []
         for remote_path, file_size in file_list:
@@ -226,35 +301,44 @@ class FTPDownloader:
             bar.close()
         
         self.bar.close()
+        
+        # move sfdl to download folder
+        self.move_file(self.sfdl_file, self.download_folder)
+        # get download time
+        self.done_time = time.time() - self.start_time
+        speed = self.calculate_download_speed(total_size, self.done_time)
+        elapsed_time = self.seconds_to_readable_time(self.done_time)
+        
+        print(f" \033[93;1mDownload completed in\033[0m \033[92;1m{elapsed_time} ({speed}/s)\033[0m")
+        __download_running__ = False
+        
+        # start next download if there is one
+        if __monitor_mode__ is True:
+            time.sleep(5)
+            nextDownload = WatcherHandler
+            nextDownload.update_file_paths
 
     def download_in_thread(self, remote_path, local_file, file_size, total_files):
-        newBarIndex = len(self.bars)
+        newBarIndex = self.bars_count
         ftp = None
         e = None
         try:
             try:
-                # ftp = self.connect()
                 ftp = self.get_ftp_session()
             except (error_temp, error_perm, error_proto, error_reply, Error, socket_error) as e:
-                print(f" \033[91;1mDownload Thread Error: {e}\033[0m")
+                if __printdebug__: print(f" \033[91;1mDownload Thread Error: {e}\033[0m")
             
             if ftp is not None:
                 with self.thread_semaphore:
                     self.download_with_progress(ftp, remote_path, local_file, file_size, total_files, newBarIndex)
             else:
-                print(f" \033[91;1m[1] FTP Connection Error: {e}\033[0m")
+                if __printdebug__: print(f" \033[91;1m[1] FTP Connection Error: {e}\033[0m")
         except threading.ThreadError as te:
-            print(f" \033[91;1mDownload Thread Error: {te}\033[0m")
+            if __printdebug__: print(f" \033[91;1mDownload Thread Error: {te}\033[0m")
         finally:
             if ftp is not None:
-                # print("[0] Downloaded " + str(local_file) + " successfully!")
+                if __printdebug__: print(f" \033[93;1mDownloaded\033[0m \033[92;1m{local_file}\033[0m \033[93;1msuccessfully!\033[0m")
                 ftp.close()
-            if newBarIndex < len(self.bars):
-                self.bars[newBarIndex].close()
-                self.bars[newBarIndex].clear()
-            else:
-                self.bars[0].close()
-                self.bars[0].clear()
 
     def download_with_progress(self, ftp, remote_path, local_file, file_size, total_files, newBarIndex):
         local_filepath = os.path.join(self.download_folder, local_file)
@@ -270,6 +354,11 @@ class FTPDownloader:
                     self.bars.append(tqdm.tqdm(total=file_size, unit_scale=True, desc=f' \033[93;1mLoading\033[0m \033[92;1m{local_filename}\033[0m', miniters=1, file=sys.stdout, leave=False, colour="yellow"))
                 self.bars_count += 1
                 
+                # check if we got a partial file and continue download if so
+                if os.path.exists(local_filepath):
+                    local_file_size = os.path.getsize(local_filepath)
+                    ftp.sendcmd(f"REST {local_file_size}")
+                
                 ftp.retrbinary(f"RETR {remote_path}", lambda data: self.write_with_progress(data, local_filepath, remote_path, file_size, total_files, newBarIndex), blocksize=1024)
                 
             except (error_temp, error_perm, error_proto, error_reply, Error, socket_error) as e:
@@ -277,9 +366,9 @@ class FTPDownloader:
                 error_message = str(e).lower().strip()
                 if error_message.startswith("553") or error_message.startswith("530"):
                     if ftp is not None:
-                        # print("[2] Download: Closing connection!")
+                        if __printdebug__: print("[2] Download: Closing connection!")
                         ftp.close()
-                    # print("[2] Download: Server maximum connections reached ... retry in 10 ...")
+                    if __printdebug__: print("[2] Download: Server maximum connections reached ... retry in 10 ...")
                     time.sleep(10)
                     self.download_in_thread(remote_path, local_file, file_size, total_files)
                     sys.exit() # end current thread
@@ -288,31 +377,10 @@ class FTPDownloader:
             finally:
                 if ftp is not None:
                     ftp.close()
-                self.bars[newBarIndex].close()
-                self.bars[newBarIndex].clear()
 
     def write_with_progress(self, data, local_filepath, remote_path, file_size, total_files, newBarIndex):
-        if self.download_folder is None:
-            local_filepath = os.path.join(self.download_folder, local_file)
-        else:
-            local_filepath = self.download_folder
         
-        release = None
-        if self.release_name is not None:
-            release = self.release_name
-        else:
-            release = self.get_release_from_path(remote_path)
-        
-        index = remote_path.find(release)
-        
-        subdir = None
-        if index != -1:
-            subdir = remote_path[index + len(release):]
-            local_filepath = local_filepath + "/" + release + "/" + subdir
-        else:
-            local_filepath = local_filepath + "/" + release
-        
-        local_filepath = local_filepath.replace("//", "/")
+        local_filepath = self.return_local_file_path(local_filepath, remote_path)
         self.ensure_directory_exists(local_filepath)
         
         try:
@@ -324,10 +392,119 @@ class FTPDownloader:
         except Exception as e:
             print(f" \033[91;1mError can't write file: {e}\033[0m")
 
-    def ensure_directory_exists(self, file_path):
-        directory = os.path.dirname(file_path)
-        if not os.path.exists(directory):
-            os.makedirs(directory)
+class WatcherHandler(FileSystemEventHandler):
+    sfdl_files = []
+
+    def __init__(self, directory_to_watch, password, destination, threads):
+        super().__init__()
+        self.directory_to_watch = directory_to_watch
+        self.password = password
+        self.destination = destination
+        self.threads = threads
+        self.file_paths = WatcherHandler.sfdl_files
+        self.initialize_existing_files()
+        
+    def initialize_existing_files(self):
+        for root, dirs, files in os.walk(self.directory_to_watch):
+            for file in files:
+                file_path = os.path.join(root, file)
+                if file_path.lower().endswith(".sfdl") and file_path not in self.file_paths and os.path.exists(file_path):
+                    if os.path.exists(file_path):
+                        if __printdebug__: print(f" SFDL found: {file_path}")
+                        self.file_paths.append(file_path)
+                        self.update_file_paths()
+
+    def on_created(self, event):
+        if event.is_directory:
+            return
+        file_path = event.src_path
+        if file_path.lower().endswith(".sfdl") and file_path not in self.file_paths and os.path.exists(file_path):
+            if __printdebug__: print(f" New SFDL found: {file_path}")
+            self.file_paths.append(file_path)
+            self.update_file_paths()
+
+    def on_modified(self, event):
+        if not event.is_directory:
+            file_path = event.src_path
+            if file_path.lower().endswith(".sfdl") and file_path not in self.file_paths and os.path.exists(file_path):
+                if __printdebug__: print(f" Existing SFDL found: {file_path}")
+                self.file_paths.append(file_path)
+                self.update_file_paths()
+                
+    def on_deleted(self, event):
+        if not event.is_directory:
+            file_path = event.src_path
+            if file_path.lower().endswith(".sfdl") and file_path in self.file_paths:
+                if __printdebug__: print(f" SFDL {file_path} got deleted!")
+                self.file_paths.remove(file_path)
+                self.update_file_paths()
+
+    def update_file_paths(self):
+        updated_file_paths = []
+        for file_path in self.file_paths:
+            try:
+                os.path.getmtime(file_path)
+                if os.path.exists(file_path):
+                    updated_file_paths.append(file_path)
+            except (OSError, FileNotFoundError):
+                if __printdebug__: print(f" SFDL {file_path} got deleted or is no longer accessible!")
+                
+        updated_file_paths = sorted(updated_file_paths, key=os.path.getmtime, reverse=False)
+        self.file_paths = updated_file_paths
+        if __printdebug__: print(self.file_paths)
+        if len(self.file_paths):
+            if __download_running__ is False:
+                printBanner()
+                self.startDownload(self.file_paths[0])
+    
+    # start new download
+    def startDownload(self, sfdl_file):
+        sfdl = getSFDL(sfdl_file)
+        sfdl_data = []
+        sfdl_data = readSFDL(sfdl, self.password)
+        release_name, ftp_host, ftp_port, ftp_user, ftp_pass, ftp_path = (None, None, None, None, None, None)
+        if sfdl_data is not None:
+            release_name = sfdl_data['release_name']
+            ftp_host = sfdl_data['ftp_host']
+            ftp_port = sfdl_data['ftp_port']
+            ftp_user = sfdl_data['ftp_user']
+            ftp_pass = sfdl_data['ftp_pass']
+            ftp_path = sfdl_data['ftp_path']
+        else:
+            print(f" \033[91;1mError: Can't read data from {sfdl_file}!\033[0m")
+            
+        if all(variable is not None for variable in [ftp_host, ftp_port, ftp_path]):
+            main(ftp_host, int(ftp_port), ftp_user, ftp_pass, ftp_path, self.destination, int(self.threads), release_name, proxy, sfdl_file)
+        else:
+            print(f" \033[91;1mError: Missing FTP data from SFDL file!\033[0m")
+            # rename sfdl file to sfdl.err to exclude it from downloads
+            try:
+                os.rename(sfdl_file, sfdl_file + ".err")
+                if __printdebug__: print(f" \033[91;1mError: Renaming {sfdl_file} to {sfdl_file}.err!\033[0m")
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                pass
+
+class FileWatcher:
+    def __init__(self, directory_to_watch, password, destination, threads):
+        self.handler = WatcherHandler(directory_to_watch, password, destination, threads)
+        self.observer = Observer()
+        self.observer_thread = None
+
+    def start_watching(self):
+        self.observer.schedule(self.handler, path=self.handler.directory_to_watch, recursive=True)
+        self.observer.start()
+        
+        print(f" \033[93;1mpySFDLSauger watchdog is now running, automatic download service ready!\033[0m")
+        print(f" \033[93;1mAdd new SFDL files in\033[0m \033[94;1m{self.handler.directory_to_watch}\033[0m \033[93;1mfor automatic downloads!\033[0m")
+
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.observer.stop()
+            self.observer.join()
 
 def bytes2human(byte_size, base=1024):
     if byte_size == 0:
@@ -336,6 +513,44 @@ def bytes2human(byte_size, base=1024):
     exponent = min(int(log2(byte_size) // log2(base)), len(size_names) - 1)
     converted_size = round(byte_size / (base ** (exponent)), 2)
     return f"{converted_size} {size_names[exponent]}"
+
+def readSFDL(sfdl_file, password):
+    sfdl_data = {}
+    
+    root = ET.fromstring(sfdl_file)
+
+    encrypted = root.find('Encrypted').text
+    release_name = root.find('Description').text
+    
+    connection_info = root.find('ConnectionInfo')
+    
+    if connection_info is not None:
+        ftp_host = connection_info.find('Host').text if connection_info.find('Host') is not None else None
+        ftp_port = connection_info.find('Port').text if connection_info.find('Port') is not None else None
+        ftp_user = connection_info.find('Username').text if connection_info.find('Username') is not None else None
+        ftp_pass = connection_info.find('Password').text if connection_info.find('Password') is not None else None
+        ftp_path = connection_info.find('BulkFolderPath').text if connection_info.find('BulkFolderPath') is not None else None
+
+    ftp_path = root.find('Packages/SFDLPackage/BulkFolderList/BulkFolder/BulkFolderPath').text if root.find('Packages/SFDLPackage/BulkFolderList/BulkFolder/BulkFolderPath') is not None else None
+    
+    if encrypted == 'true':
+        release_name = decrypt_aes_cbc_128(release_name, password)
+        ftp_host = decrypt_aes_cbc_128(ftp_host, password)
+        ftp_user = decrypt_aes_cbc_128(ftp_user, password)
+        ftp_pass = decrypt_aes_cbc_128(ftp_pass, password)
+        ftp_path = decrypt_aes_cbc_128(ftp_path, password)
+        
+    sfdl_data['release_name'] = release_name
+    sfdl_data['ftp_host'] = ftp_host
+    sfdl_data['ftp_port'] = ftp_port
+    sfdl_data['ftp_user'] = ftp_user
+    sfdl_data['ftp_pass'] = ftp_pass
+    sfdl_data['ftp_path'] = ftp_path
+    
+    if sfdl_data:
+        return sfdl_data
+    else:
+        return None
 
 # get SFDL file from url or local file
 # url can be a local file or web source http(s)
@@ -406,28 +621,66 @@ def get_ftp_file_index(ftp_host, ftp_port, ftp_user, ftp_pass, ftp_path, proxy, 
         if ftp_client:
             ftp_client.close()
 
-# connect to ftp server and download files from index
-def download_files(ftp_host, ftp_port, ftp_user, ftp_pass, destination, max_threads, release_name, files, proxy):
+# connect to ftp server and download files for index
+def download_files(ftp_host, ftp_port, ftp_user, ftp_pass, destination, max_threads, release_name, files, proxy, sfdl_file):
     print(f" \033[93;1mStart Download:\033[0m \033[95;1m{release_name}\033[0m")
     total_size = bytes2human(sum(file_size for _, file_size in files), base=1000)
     print(f" \033[93;1mLoading\033[0m \033[92;1m{len(files)}\033[0m \033[93;1mfiles\033[0m \033[92;1m({total_size})\033[0m \033[93;1musing\033[0m \033[92;1m{max_threads}\033[0m \033[93;1mthreads\033[0m")
     try:
-        ftp_downloader = FTPDownloader(ftp_host, ftp_port, ftp_user, ftp_pass, destination, max_threads, release_name, proxy)
+        ftp_downloader = FTPDownloader(ftp_host, ftp_port, ftp_user, ftp_pass, destination, max_threads, release_name, proxy, sfdl_file)
         ftp_downloader.connect()
         ftp_downloader.download_multiple_files(files)
     except (error_temp, error_perm, error_proto, error_reply, Error, socket_error) as e:
         print(f" \033[91;1mFTP-Download Error: {e}\033[0m")
 
-def main(ftp_host, ftp_port, ftp_user, ftp_pass, ftp_path, destination, max_threads, release_name, proxy): 
+# help the user to install missing packages using pip
+def check_and_install_packages(packages):
+    missing_packages = []
+
+    # check for missing required python packages
+    for package in packages:
+        try:
+            __import__(package)
+        except ImportError:
+            missing_packages.append(package)
+
+    if missing_packages:
+        print("Missing Python packages: {}".format(", ".join(missing_packages)))
+        
+        def check_pip_availability():
+            return shutil.which('pip') is not None
+        
+        # check for pip
+        if not check_pip_availability():
+            print("pip is not available! Can't help you install missing Python packages ...")
+            print("... you are on your own, good luck!")
+            return False
+    
+        # runnung pip
+        print("Running: pip install {}".format(" ".join(missing_packages)))
+        install_command = ["pip", "install"] + missing_packages
+
+        try:
+            subprocess.check_call(install_command)
+            print("Success! All missing Python packages are now installed!")
+            return True
+        except subprocess.CalledProcessError as e:
+            print("Error: pip was not able to install all the packages!") 
+            return False
+
+    return True  # Keine fehlenden Pakete
+
+def main(ftp_host, ftp_port, ftp_user, ftp_pass, ftp_path, destination, max_threads, release_name, proxy, sfdl_file): 
     files = None
     files = get_ftp_file_index(ftp_host, ftp_port, ftp_user, ftp_pass, ftp_path, proxy, release_name)
     
     if files is not None and len(files) > 0:
-        download_files(ftp_host, ftp_port, ftp_user, ftp_pass, destination, max_threads, release_name, files, proxy)
+        download_files(ftp_host, ftp_port, ftp_user, ftp_pass, destination, max_threads, release_name, files, proxy, sfdl_file)
     else:
         print(" \033[91;1mError: No files to download! (Empty files index)\033[0m")
 
 def printBanner():
+    os.system('cls' if os.name == 'nt' else 'clear') # clear console
     banner = r'''
                   _____ ______ _____  _       _____                             
                  / ____|  ____|  __ \| |     / ____|                            
@@ -442,18 +695,15 @@ def printBanner():
     
     colored_lines = f"\033[92m{banner}\033[0m"
     print(colored_lines)
+    print(f" \033[93;1mpySFDLSauger \033[91;1m{__version__}\033[0m \033[93;1m(GrafSauger)\033[0m")
 
 
 # pySFDLSauger (GrafSauger)
 # Nur die harten Sauger kommen durch!
 if __name__ == "__main__":
-    VERSION = '2.0.1'
-    
-    os.system('cls' if os.name == 'nt' else 'clear') # clear console
     printBanner()
-    print(f" \033[93;1mpySFDLSauger \033[91;1m{VERSION}\033[0m \033[93;1m(GrafSauger)\033[0m")
     
-    parser = argparse.ArgumentParser(description='''pySFDLSauger {VERSION} (GrafSauger)
+    parser = argparse.ArgumentParser(description=f'''pySFDLSauger {__version__} (GrafSauger)
     Example: pySFDLSauger.py --sfdl /home/user/downloads/my.sfdl
     Example: pySFDLSauger.py --sfdl https://download.schnuffy.net/enc/00000000;MyRelease.action.movie.3033-SAUGER
     Example: pySFDLSauger.py --sfdl C:/downloads/my.sfdl --destination C:/downloads --threads 10''', formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -462,18 +712,31 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--destination", help="Download destination")
     parser.add_argument("-t", "--threads", help="Max download threads (default: 3)")
     parser.add_argument("-p", "--password", help="SFDL Password (default: mlcboard.com)")
+    parser.add_argument("-m", "--monitor", help="Monitor path for SFDL files [auto downloader] (default: None)")
     parser.add_argument("--proxy_host", help="Socks5 Host")
     parser.add_argument("--proxy_port", help="Socks5 Port")
     parser.add_argument("--proxy_user", help="Socks5 Username")
     parser.add_argument("--proxy_pass", help="Socks5 Password")
     parser.add_argument("--debug", help="Debug (default: None)")
+    parser.add_argument("--nockeck", help="Disable package check (default: None)")
     
     args = parser.parse_args()
+    
+    # check for missing python packages and try to install them using pip
+    nockeck = args.nockeck if args.nockeck is not None else None
+    if nockeck is None:
+        if not check_and_install_packages(__required_packages__):
+            print("There are still missing Python packages to run pySFDLSauger!")
+            print("Please install all missing packages first and try again!")
+            print("END OF LINE")
+            sys.exit(1)
 
     sfdl = args.sfdl if args.sfdl is not None else None
     destination = args.destination if args.destination is not None else None
     threads = args.threads if args.threads is not None else 3
     password = args.password if args.password is not None else None
+    
+    monitor = args.monitor if args.monitor is not None else None
     
     proxy_host = args.proxy_host if args.proxy_host is not None else None
     proxy_port = args.proxy_port if args.proxy_port is not None else None
@@ -481,11 +744,8 @@ if __name__ == "__main__":
     proxy_pass = args.proxy_pass if args.proxy_pass is not None else None
     
     debug = args.debug if args.debug is not None else None
-    
-    if sfdl is None:
-        print(" \033[91;1mError: No SFDL file set!\033[0m")
-        parser.print_help()
-        sys.exit(1)
+    if debug is not None:
+        __printdebug__ = True
     
     if destination is None:
         if os.name == 'posix':
@@ -499,39 +759,42 @@ if __name__ == "__main__":
     proxy = None
     if proxy_host is not None and proxy_port is not None:
         proxy = Proxy(proxy_host, proxy_port, username=proxy_user, password=proxy_pass)
-
-    # get SFDL file data from web or local file
-    sfdl_file = getSFDL(sfdl)
     
     # set default password for encrypted sfdl files
     if password is None:
         password = "mlcboard.com"
-
-    # XML-Datei einlesen
-    root = ET.fromstring(sfdl_file)
-
-    encrypted = root.find('Encrypted').text
-    release_name = root.find('Description').text
     
-    connection_info = root.find('ConnectionInfo')
+    # start watchdog service to monitor path for new sfdl files
+    if monitor is not None:
+        __monitor_mode__ = True
+        watchdog_path = os.path.normpath(monitor)
+        if os.path.exists(watchdog_path) and os.path.isdir(watchdog_path):
+            watcher = FileWatcher(watchdog_path, password, destination, threads)
+            watcher.start_watching()
+        else:
+            print(f" \033[91;1mError: Sorry, but {watchdog_path} does not exist!\033[0m")
+            parser.print_help()
+            sys.exit(1)
     
-    if connection_info is not None:
-        ftp_host = connection_info.find('Host').text if connection_info.find('Host') is not None else None
-        ftp_port = connection_info.find('Port').text if connection_info.find('Port') is not None else None
-        ftp_user = connection_info.find('Username').text if connection_info.find('Username') is not None else None
-        ftp_pass = connection_info.find('Password').text if connection_info.find('Password') is not None else None
-        ftp_path = connection_info.find('BulkFolderPath').text if connection_info.find('BulkFolderPath') is not None else None
-
-    ftp_path = root.find('Packages/SFDLPackage/BulkFolderList/BulkFolder/BulkFolderPath').text if root.find('Packages/SFDLPackage/BulkFolderList/BulkFolder/BulkFolderPath') is not None else None
+    if sfdl is None:
+        print(" \033[91;1mError: No SFDL file set!\033[0m")
+        parser.print_help()
+        sys.exit(1)
     
-    if encrypted == 'true':
-        release_name = decrypt_aes_cbc_128(release_name, password)
-        ftp_host = decrypt_aes_cbc_128(ftp_host, password)
-        ftp_user = decrypt_aes_cbc_128(ftp_user, password)
-        ftp_pass = decrypt_aes_cbc_128(ftp_pass, password)
-        ftp_path = decrypt_aes_cbc_128(ftp_path, password)
+    # get SFDL file data from web or local file
+    sfdl_file = getSFDL(sfdl)
+    
+    sfdl_data = readSFDL(sfdl_file, password)
+    release_name, ftp_host, ftp_port, ftp_user, ftp_pass, ftp_path = None
+    if sfdl_data is not None:
+        release_name = sfdl_data['release_name']
+        ftp_host = sfdl_data['ftp_host']
+        ftp_port = sfdl_data['ftp_port']
+        ftp_user = sfdl_data['ftp_user']
+        ftp_pass = sfdl_data['ftp_pass']
+        ftp_path = sfdl_data['ftp_path']
 
-    if debug is not None:
+    if __printdebug__:
         print("===== DEBUG ====")
         print(f"SFDL: {sfdl}")
         print(f"SFDL-Pass: {password}")
@@ -548,4 +811,9 @@ if __name__ == "__main__":
         print(f"proxy_pass: {proxy_pass}")
         print("===== DEBUG ====")
 
-    main(ftp_host, int(ftp_port), ftp_user, ftp_pass, ftp_path, destination, int(threads), release_name, proxy)
+    if all(variable is not None for variable in [ftp_host, ftp_port, ftp_path]):
+        main(ftp_host, int(ftp_port), ftp_user, ftp_pass, ftp_path, destination, int(threads), release_name, proxy, sfdl)
+    else:
+        print(f" \033[91;1mError: Missing FTP data from SFDL file!\033[0m")
+        parser.print_help()
+        sys.exit(1)
