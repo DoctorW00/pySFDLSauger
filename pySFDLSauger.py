@@ -10,7 +10,7 @@ import xml.etree.ElementTree as ET
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 __printdebug__ = False
 __required_packages__ = ['tqdm', 'requests', 'cryptography', 'socks', 'sockshandler', 'urllib3', 'watchdog']
 __download_running__ = False
@@ -90,37 +90,54 @@ class FTPList:
         # get some workaround going to get better results from more ftp servers
         # try mlsd command
         try:
-            files_info = self.ftp.mlsd(facts=["type", "size"])
-            if files_info is not None:
+            files_info_generator = self.ftp.mlsd(facts=["type", "size"])
+            files_info = list(files_info_generator)
+            if isinstance(files_info, list) and files_info:
                 files = sorted(files_info)
         except Exception as e:
-            # try nlst + size command
-            file_list = self.ftp.nlst()
-            self.ftp.sendcmd("TYPE I")
-            for file_name in file_list:
-                try:
-                    size = self.ftp.size(file_name)
-                    files[file_name] = {'type': 'file', 'size': size}
-                except Exception as e:
-                    files[file_name] = {'type': 'file', 'size': None}
-            files = sorted(files.items(), key=lambda x: x[1]['size'])
-
-        for item, data in files:
-            if data["type"] == "file":
-                size = int(data["size"])
-                clean_ftp_path = self.ftp_path.rstrip("/")
-                rec_path = path.lstrip("./")
-                clean_item = item.lstrip("./")
-
-                final_full_file_path = None
-
-                if rec_path == ".":
-                    final_full_file_path = clean_ftp_path + "/" + clean_item
-                else:
-                    final_full_file_path = clean_ftp_path + "/" + rec_path + "/" + clean_item
+            if __printdebug__: print(f" FTP Error: {e}")
+            try:
+                # try nlst + size command
+                file_list_generator = self.ftp.nlst()
+                file_list = list(file_list_generator)
+                
+                if isinstance(file_list, list) and file_list:
+                    self.ftp.sendcmd("TYPE I")
+                    for item in file_list:
+                        _, file_extension = os.path.splitext(item)
+                        if file_extension:
+                            try:
+                                size = self.ftp.size(item)
+                                files[item] = {'type': 'file', 'size': size}
+                            except Exception as e:
+                                files[item] = {'type': 'file', 'size': None}
                     
-                final_full_file_path = final_full_file_path.replace("//", "/")
-                self.files.append((final_full_file_path, size))
+                    files = sorted(files.items(), key=lambda x: x[1]['size'])
+            except Exception as e:
+                if __printdebug__: print(f" FTP Error: {e}")
+                pass
+
+
+        try:
+            for item, data in files:
+                    if data["type"] == "file":
+                        size = int(data["size"])
+                        clean_ftp_path = self.ftp_path.rstrip("/")
+                        rec_path = path.lstrip("./")
+                        clean_item = item.lstrip("./")
+
+                        final_full_file_path = None
+
+                        if rec_path == ".":
+                            final_full_file_path = clean_ftp_path + "/" + clean_item
+                        else:
+                            final_full_file_path = clean_ftp_path + "/" + rec_path + "/" + clean_item
+                            
+                        final_full_file_path = final_full_file_path.replace("//", "/")
+                        self.files.append((final_full_file_path, size))
+        except Exception as e:
+            if __printdebug__: print(f" FTP Error: {e}")
+            pass
 
         for item in files:
             try:
