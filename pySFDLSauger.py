@@ -10,11 +10,12 @@ import xml.etree.ElementTree as ET
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-__version__ = "2.0.7"
+__version__ = "2.1.0"
 __printdebug__ = False
 __required_packages__ = ['tqdm', 'requests', 'cryptography', 'socks', 'sockshandler', 'urllib3', 'watchdog']
 __download_running__ = False
 __monitor_mode__ = False
+__use_unrar__ = None
 
 class Proxy:
     def __init__(self, host, port, username=None, password=None):
@@ -161,10 +162,25 @@ class FTPDownloader:
         self.sfdl_file = sfdl_file
         self.bar = None # main progress for the whole download
         self.bars = []  # progressbars for files
+        self.bars_lock = threading.Lock()
         self.bars_count = 0
         self.start_time = 0
         self.done_time = 0
         self.b2h = bytes2human
+        self.local_download_path = None
+
+    def write_speedreport(self, path, line1, line2):
+        speedreport = path + '/speedreport.txt'
+        try:
+            with open(speedreport, 'w') as file:
+                file.write(f'Speedreport for [B]{line1}[/B]\n')
+                file.write('[HR][/HR]\n')
+                file.write(f'{line2}\n')
+                file.write(f'Thanks! :mx1_7:\n')
+                file.write(f'[URL="https://mlcboard.com/forum/showthread.php?598380"][SIZE=1][I]pySFDLSauger ({__version__})[/I][/SIZE][/URL] \n')
+            print(f' \033[93;1mSpeedreport created:\033[0m \033[94;1m{speedreport}\033[0m')
+        except Exception as e:
+            print(f" \033[91;1mError creating speedreport file: {speedreport} {e}\033[0m")
 
     def ensure_directory_exists(self, file_path):
         directory = os.path.dirname(file_path)
@@ -174,7 +190,10 @@ class FTPDownloader:
     def move_file(self, file_path, destination_path):
         try:
             dest_path = os.path.normpath(destination_path + "/" + self.release_name)
-            print(f" \033[93;1mMoving:\033[0m \033[92;1m{file_path}\033[0m \033[93;1mto\033[0m \033[92;1m{dest_path}\033[0m")
+            if __printdebug__:
+                print(f" \033[93;1mMoving:\033[0m \033[92;1m{file_path}\033[0m \033[93;1mto\033[0m \033[92;1m{dest_path}\033[0m")
+            else:
+                print(f" \033[93;1mMoving SFDL to download path!\033[0m")
             shutil.move(file_path, dest_path)
         except Exception as e:
             print(f" \033[91;1mError: Can't move SFDL to download folder: {e}\033[0m")
@@ -209,6 +228,7 @@ class FTPDownloader:
             local_filepath = local_filepath + "/" + release + "/" + subdir
         else:
             local_filepath = local_filepath + "/" + release
+        self.local_download_path = os.path.normpath(os.path.dirname(local_filepath.replace("//", "/")))
         return local_filepath.replace("//", "/")
     
     def calculate_download_speed(self, file_size, elapsed_time_seconds):
@@ -310,6 +330,19 @@ class FTPDownloader:
         elapsed_time = self.seconds_to_readable_time(self.done_time)
         
         print(f" \033[93;1mDownload completed in\033[0m \033[92;1m{elapsed_time} ({speed}/s)\033[0m")
+        
+        # create speedreport in download folder
+        self.write_speedreport(self.local_download_path, self.release_name, f'Downloaded {total_files} files in {elapsed_time} ({speed}/s)')
+        
+        # use UnRAR to rextract RAR archives
+        if __use_unrar__ is not None:
+            rar_extractor = RarExtractor(self.local_download_path, self.local_download_path, password='')
+            success = rar_extractor.extract_rar()
+            if success:
+                print(f" \033[93;1mUnRAR ALL OK!\033[0m")
+            else:
+                print(f" \033[91;1mUnRAR error!\033[0m")
+        
         __download_running__ = False
         
         # start next download if there is one
@@ -319,7 +352,6 @@ class FTPDownloader:
             nextDownload.update_file_paths
 
     def download_in_thread(self, remote_path, local_file, file_size, total_files):
-        newBarIndex = self.bars_count
         ftp = None
         e = None
         try:
@@ -330,6 +362,8 @@ class FTPDownloader:
             
             if ftp is not None:
                 with self.thread_semaphore:
+                    newBarIndex = self.bars_count
+                    self.bars_count += 1
                     self.download_with_progress(ftp, remote_path, local_file, file_size, total_files, newBarIndex)
             else:
                 if __printdebug__: print(f" \033[91;1m[1] FTP Connection Error: {e}\033[0m")
@@ -339,6 +373,13 @@ class FTPDownloader:
             if ftp is not None:
                 if __printdebug__: print(f" \033[93;1mDownloaded\033[0m \033[92;1m{local_file}\033[0m \033[93;1msuccessfully!\033[0m")
                 ftp.close()
+            # remove file progressbar
+            if newBarIndex < len(self.bars):
+                self.bars[newBarIndex].clear()
+                self.bars[newBarIndex].close()
+            else:
+                self.bars[0].clear()
+                self.bars[0].close()
 
     def download_with_progress(self, ftp, remote_path, local_file, file_size, total_files, newBarIndex):
         local_filepath = os.path.join(self.download_folder, local_file)
@@ -348,11 +389,11 @@ class FTPDownloader:
         if ftp is not None:
             try:
                 local_filename = os.path.basename(local_filepath)
+                
                 if newBarIndex < len(self.bars):
                     self.bars[newBarIndex] = tqdm.tqdm(total=file_size, unit_scale=True, desc=f' \033[93;1mLoading\033[0m \033[92;1m{local_filename}\033[0m', miniters=1, file=sys.stdout, leave=False, colour="yellow")
                 else:
                     self.bars.append(tqdm.tqdm(total=file_size, unit_scale=True, desc=f' \033[93;1mLoading\033[0m \033[92;1m{local_filename}\033[0m', miniters=1, file=sys.stdout, leave=False, colour="yellow"))
-                self.bars_count += 1
                 
                 # check if we got a partial file and continue download if so
                 if os.path.exists(local_filepath):
@@ -505,6 +546,92 @@ class FileWatcher:
         except KeyboardInterrupt:
             self.observer.stop()
             self.observer.join()
+
+class RarExtractor:
+    def __init__(self, rar_path, extract_path, password=None):
+        self.rar_path = rar_path
+        self.extract_path = extract_path
+        self.password = password
+        self.progress_regex = re.compile(r'(\d+)%')
+        self.file_info_regex = re.compile(r'Extracting from (.+)')
+
+    def find_all_rar_files(self, folder_path):
+        rar_regex = re.compile(r'^(.*?)(?:\.part\d*\.rar|\.r\d{2,}|\.[s-z]\d{2,}|\d+\.rar)$', re.IGNORECASE)
+        rar_files = [file for file in os.listdir(folder_path) if rar_regex.match(file)]
+        return [os.path.join(folder_path, file) for file in rar_files]
+
+    def find_rar_file(self, folder_path):
+        rar_regex = re.compile(r'^(.*?)(?:\.part\d*\.rar|\.rar)$', re.IGNORECASE)
+        rar_files = [file for file in os.listdir(folder_path) if rar_regex.match(file)]
+        
+        if rar_files:
+            rar_files.sort()
+            return os.path.join(folder_path, rar_files[0])
+        else:
+            return None
+
+    def delete_rar_files(self, rar_files):
+        for rar_file in tqdm.tqdm(rar_files, desc=" \033[93;1mRemoving RAR files ...\033[0m", unit="file", colour="magenta"):
+            try:
+                os.remove(rar_file)
+                if __printdebug__: print(f" \033[93;1mUnRAR removing: {rar_file}\033[0m")
+            except Exception as e:
+                print(f" \033[91;1mUnRAR error: Unable to remove: {rar_file}: {e}\033[0m")
+
+    def is_unrar_available(self):
+        try:
+            subprocess.run(['unrar'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            return True
+        except FileNotFoundError:
+            return False
+        except subprocess.CalledProcessError:
+            return False
+
+    def extract_rar(self):
+        allRARFiles = self.find_all_rar_files(self.rar_path)
+        firstRAR = self.find_rar_file(self.rar_path)
+        if firstRAR is None:
+            print(f" \033[91;1mUnRAR error: No RAR file found in {self.rar_path}\033[0m")
+            return False
+        
+        try:
+            if not self.is_unrar_available():
+                raise Exception(f" \033[91;1mUnRAR error: Can\'t find UnRAR executable! Please install UnRAR first!\033[0m")
+
+            command = ['unrar', 'x', '-o+', firstRAR, self.extract_path]
+            if self.password:
+                command.extend(['-p' + self.password])
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+            
+            with tqdm.tqdm(total=100, dynamic_ncols=True, desc=f' \033[93;1mUnRAR files ...\033[0m', unit='%', position=0, leave=True, colour="blue") as pbar:
+                current_file = None
+                for output_line in process.stdout:
+                    match = self.progress_regex.search(output_line)
+                    file_match = self.file_info_regex.search(output_line)
+
+                    if match:
+                        percent = int(match.group(1))
+                        pbar.update(percent - pbar.n)
+                    elif file_match:
+                        current_file = os.path.basename(file_match.group(1))
+                        pbar.set_description(f' \033[93;1mUnRAR\033[0m \033[91;1m{current_file}\033[0m')
+
+                if 'All OK' in output_line:
+                    pbar.update(100 - pbar.n)
+
+            process.wait()
+
+            if 'All OK' not in output_line:
+                print(f" \033[91;1mUnRAR error: ALL OK message NOT found!\033[0m")
+                return False
+            else:
+                if __printdebug__: print(f" \033[93;1mUnRAR ALL OK ... remvoing RAR files ...\033[0m")
+                self.delete_rar_files(allRARFiles)
+                return True
+        except Exception as e:
+            print(f" \033[91;1mUnRAR error: {e}\033[0m")
+            return False
 
 def bytes2human(byte_size, base=1024):
     if byte_size == 0:
@@ -697,7 +824,6 @@ def printBanner():
     print(colored_lines)
     print(f" \033[93;1mpySFDLSauger \033[91;1m{__version__}\033[0m \033[93;1m(GrafSauger)\033[0m")
 
-
 # pySFDLSauger (GrafSauger)
 # Nur die harten Sauger kommen durch!
 if __name__ == "__main__":
@@ -713,6 +839,7 @@ if __name__ == "__main__":
     parser.add_argument("-t", "--threads", help="Max download threads (default: 3)")
     parser.add_argument("-p", "--password", help="SFDL Password (default: mlcboard.com)")
     parser.add_argument("-m", "--monitor", help="Monitor path for SFDL files [auto downloader] (default: None)")
+    parser.add_argument("-u", "--unrar", help="Use UnRAR to extract downloads (default: True)")
     parser.add_argument("--proxy_host", help="Socks5 Host")
     parser.add_argument("--proxy_port", help="Socks5 Port")
     parser.add_argument("--proxy_user", help="Socks5 Username")
@@ -735,8 +862,9 @@ if __name__ == "__main__":
     destination = args.destination if args.destination is not None else None
     threads = args.threads if args.threads is not None else 3
     password = args.password if args.password is not None else None
-    
     monitor = args.monitor if args.monitor is not None else None
+    
+    __use_unrar__ = None if args.unrar is not None else True
     
     proxy_host = args.proxy_host if args.proxy_host is not None else None
     proxy_port = args.proxy_port if args.proxy_port is not None else None
@@ -785,7 +913,7 @@ if __name__ == "__main__":
     sfdl_file = getSFDL(sfdl)
     
     sfdl_data = readSFDL(sfdl_file, password)
-    release_name, ftp_host, ftp_port, ftp_user, ftp_pass, ftp_path = None
+    release_name, ftp_host, ftp_port, ftp_user, ftp_pass, ftp_path = (None, None, None, None, None, None)
     if sfdl_data is not None:
         release_name = sfdl_data['release_name']
         ftp_host = sfdl_data['ftp_host']
