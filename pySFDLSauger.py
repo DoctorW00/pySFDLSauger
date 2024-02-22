@@ -11,11 +11,12 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from concurrent.futures import ThreadPoolExecutor
 
-__version__ = "2.1.3"
+__version__ = "2.1.5"
 __printdebug__ = False
 __download_running__ = False
 __monitor_mode__ = False
 __use_unrar__ = None
+__exclude_files__ = []
 
 class Proxy:
     def __init__(self, host, port, username=None, password=None):
@@ -29,7 +30,7 @@ class Proxy:
         self.proxy.close()
 
 class FTPList:
-    def __init__(self, ftp_host=None, ftp_port=21, ftp_user="anonymous", ftp_pass="anonymous@sauger.local", ftp_path=None, proxy=None):
+    def __init__(self, ftp_host=None, ftp_port=21, ftp_user="anonymous", ftp_pass="anonymous@sauger.local", ftp_path=None, release_name=None, proxy=None):
         self.ftp = None
         self.files = []
         self.files_index = 0
@@ -38,19 +39,11 @@ class FTPList:
         self.ftp_user = ftp_user
         self.ftp_pass = ftp_pass
         self.ftp_path = ftp_path
+        self.release_name = release_name
+        self.exclude_files = __exclude_files__
         self.proxy = proxy
-
-    def get_final_destination(self, ftp_full_path):
-        destination_path = None
-        destination_file = None
-        destination_file = ftp_full_path.rsplit('/', 1)[-1]
-
-        if self.destination_path is not None and self.release_name is not None and destination_file is not None:
-            destination_path = self.destination_path + "/" + self.release_name + "/" + destination_file
-            destination_path = destination_path.replace("//", "/")
-            return destination_path
-        else:
-            return None
+        self.saugerDesign = "\033[93;1m{desc}\033[0m"
+        self.dummy_progressbar = tqdm.tqdm(total=None, desc=f' \033[93;1mFile index running ...\033[0m', bar_format=self.saugerDesign, miniters=1, file=sys.stdout, leave=False, colour="magenta")
 
     def file_by_index(self, index):
         if 0 <= index < len(self.files):
@@ -61,6 +54,7 @@ class FTPList:
     def ftp_login(self):
         __download_running__ = True
         try:
+            if __printdebug__: print(f" \033[91;1mFTPList: Connect to ftp server ...\033[0m")
             self.ftp = FTP()
             if self.proxy is not None:
                 self.ftp.sock = self.proxy
@@ -73,16 +67,31 @@ class FTPList:
             self.close()
             sys.exit(1)
 
+    def return_clean_ftp_path(self, path, item):
+        clean_ftp_path = self.ftp_path.rstrip("/")
+        rec_path = path.lstrip("./")
+        clean_item = item.lstrip("./")
+        final_full_file_path = None
+        if rec_path == ".":
+            final_full_file_path = clean_ftp_path + "/" + clean_item
+        else:
+            final_full_file_path = clean_ftp_path + "/" + rec_path + "/" + clean_item
+        final_full_file_path = os.path.normpath(final_full_file_path).replace(os.sep, '/')
+        return final_full_file_path
+
     def list_files(self, path="."):
         if self.ftp is None:
             self.ftp_login()
-            return
+            pass
 
         full_path = f"{self.ftp_path}/{path}" if path != "." else self.ftp_path
+        full_path = os.path.normpath(full_path).replace(os.sep, '/')
 
         try:
+            if __printdebug__: print(f" \033[91;1mFTP get index for: {full_path}\033[0m")
             self.ftp.cwd(full_path)
-        except Exception:
+        except Exception as e:
+            if __printdebug__: print(f" \033[91;1mError: FTP index (cwd): {e}\033[0m")
             return
         
         files = {}
@@ -120,35 +129,35 @@ class FTPList:
 
         try:
             for item, data in files:
-                    if data["type"] == "file":
-                        size = int(data["size"])
-                        clean_ftp_path = self.ftp_path.rstrip("/")
-                        rec_path = path.lstrip("./")
-                        clean_item = item.lstrip("./")
-
-                        final_full_file_path = None
-
-                        if rec_path == ".":
-                            final_full_file_path = clean_ftp_path + "/" + clean_item
-                        else:
-                            final_full_file_path = clean_ftp_path + "/" + rec_path + "/" + clean_item
-                            
-                        final_full_file_path = final_full_file_path.replace("//", "/")
+                if data["type"] == "file":
+                    self.dummy_progressbar.set_description(f' \033[93;1mFile:\033[0m \033[92;1m{item}\033[0m')
+                    size = int(data["size"])
+                    final_full_file_path = self.return_clean_ftp_path(path, item)
+                    # check for files to exclude from download
+                    match = any(element in item.lower() for element in self.exclude_files)
+                    if match:
+                        # exlude from download
+                        if __printdebug__: print(f" \033[91;1mFTP-Index exclude file: {final_full_file_path}\033[0m")
+                    else:
                         self.files.append((final_full_file_path, size))
+                        if __printdebug__: print(f" \033[91;1mFTP-Index file found: {final_full_file_path}\033[0m")
+                # also index all sub-dirs
+                elif data["type"] == "dir":
+                    self.dummy_progressbar.set_description(f' \033[93;1mSub-Dir:\033[0m \033[92;1m{item}\033[0m')
+                    subdirectory_path = os.path.normpath(item).replace(os.sep, '/')
+                    if __printdebug__: print(f" \033[91;1mFTP-Index found sub-dir: {subdirectory_path}\033[0m")
+                    try:
+                        self.list_files(subdirectory_path)
+                    except Exception as e:
+                        if __printdebug__: print(f" \033[91;1mError: FTP list subdir: {subdirectory_path} {e}\033[0m")
+                        pass
         except Exception as e:
             if __printdebug__: print(f" \033[91;1mFTP Error: {e}\033[0m")
             pass
-
-        for item in files:
-            try:
-                self.list_files(f"{path}/{item}")
-            except Exception as e:
-                pass
         
         if self.files is not None:
             self.close()
         
-        if __printdebug__: print(f" \033[91;1mFTP list of files: {self.files}\033[0m")
         return self.files
 
     def close(self):
@@ -185,6 +194,7 @@ class FTPDownloader:
         self.done_time = 0
         self.b2h = bytes2human
         self.local_download_path = None
+        self.executor = None
 
     def write_speedreport(self, path, line1, line2):
         speedreport = path + '/speedreport.txt'
@@ -316,6 +326,10 @@ class FTPDownloader:
             if __printdebug__: print(f" \033[91;1m[1] EOFError in get_ftp_session: {eof_error}\033[0m")
             return None
     
+    def stop_all_threads(self):
+        if self.executor is not None:
+            self.executor.shutdown(wait=True)
+    
     def download_multiple_files(self, file_list):
         __download_running__ = True
         self.start_time = time.time()
@@ -323,9 +337,11 @@ class FTPDownloader:
         total_size = sum(file_size for _, file_size in file_list)
         total_files = len(file_list)
         
-        self.bar = tqdm.tqdm(total=total_size, unit_scale=True, dynamic_ncols=True, desc=f' \033[91;1m{self.release_name}\033[0m', miniters=1, file=sys.stdout, leave=True, colour="green")
+        saugerDesign = "\033[93;1m{desc}\033[0m \033[93;1m{percentage:3.0f}%\033[0m \033[93;1m|\033[0m{bar}\033[93;1m|\033[0m \033[93;1m{n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]\033[0m"
+        self.bar = tqdm.tqdm(total=total_size, unit_scale=True, dynamic_ncols=True, bar_format=saugerDesign, desc=f' \033[91;1m{self.release_name}\033[0m', miniters=1, file=sys.stdout, leave=True, colour="green")
 
         with ThreadPoolExecutor(max_workers=self.max_threads) as executor:
+            self.executor = executor
             futures = []
             for remote_path, file_size in file_list:
                 local_file = os.path.basename(remote_path)
@@ -358,8 +374,6 @@ class FTPDownloader:
             success = rar_extractor.extract_rar()
             if success:
                 print(f" \033[93;1mUnRAR ALL OK!\033[0m")
-            else:
-                print(f" \033[91;1mUnRAR error!\033[0m")
         
         __download_running__ = False
         
@@ -410,10 +424,11 @@ class FTPDownloader:
                 local_filename = os.path.basename(local_filepath)   
                 restarg = {}
                 
+                saugerDesign = "\033[93;1m{desc}\033[0m \033[93;1m{percentage:3.0f}%\033[0m \033[93;1m|\033[0m{bar}\033[93;1m|\033[0m \033[93;1m{n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]\033[0m"
                 if newBarIndex < len(self.bars):
-                    self.bars[newBarIndex] = tqdm.tqdm(total=file_size, unit_scale=True, desc=f' \033[93;1mLoading\033[0m \033[92;1m{local_filename}\033[0m', miniters=1, file=sys.stdout, leave=False, colour="yellow")
+                    self.bars[newBarIndex] = tqdm.tqdm(total=file_size, unit_scale=True, bar_format=saugerDesign, desc=f' \033[93;1mLoading\033[0m \033[92;1m{local_filename}\033[0m', miniters=1, file=sys.stdout, leave=False, colour="yellow")
                 else:
-                    self.bars.append(tqdm.tqdm(total=file_size, unit_scale=True, desc=f' \033[93;1mLoading\033[0m \033[92;1m{local_filename}\033[0m', miniters=1, file=sys.stdout, leave=False, colour="yellow"))
+                    self.bars.append(tqdm.tqdm(total=file_size, unit_scale=True, bar_format=saugerDesign, desc=f' \033[93;1mLoading\033[0m \033[92;1m{local_filename}\033[0m', miniters=1, file=sys.stdout, leave=False, colour="yellow"))
                 
                 # check if we got a partial file and continue download if so
                 filePath = os.path.normpath(self.return_local_file_path(local_filepath, remote_path))
@@ -592,6 +607,7 @@ class RarExtractor:
         self.password = password
         self.progress_regex = re.compile(r'(\d+)%')
         self.file_info_regex = re.compile(r'Extracting from (.+)')
+        self.saugerDesign = "\033[93;1m{desc}\033[0m \033[93;1m{percentage:3.0f}%\033[0m \033[93;1m|\033[0m{bar}\033[93;1m|\033[0m \033[93;1m{n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]\033[0m"
 
     def find_all_rar_files(self, folder_path):
         rar_regex = re.compile(r'^(.*?)(?:\.part\d*\.rar|\.r\d{2,}|\.[s-z]\d{2,}|\d+\.rar)$', re.IGNORECASE)
@@ -609,7 +625,7 @@ class RarExtractor:
             return None
 
     def delete_rar_files(self, rar_files):
-        for rar_file in tqdm.tqdm(rar_files, desc=" \033[93;1mRemoving RAR files ...\033[0m", unit="file", colour="magenta"):
+        for rar_file in tqdm.tqdm(rar_files, bar_format=self.saugerDesign, desc=" \033[93;1mRemoving RAR files ...\033[0m", unit="file", colour="magenta"):
             try:
                 os.remove(rar_file)
                 if __printdebug__: print(f" \033[93;1mUnRAR removing: {rar_file}\033[0m")
@@ -642,7 +658,7 @@ class RarExtractor:
 
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
             
-            with tqdm.tqdm(total=100, dynamic_ncols=True, desc=f' \033[93;1mUnRAR files ...\033[0m', unit='%', position=0, leave=True, colour="blue") as pbar:
+            with tqdm.tqdm(total=100, dynamic_ncols=True, bar_format=self.saugerDesign, desc=f' \033[93;1mUnRAR files ...\033[0m', unit='%', position=0, leave=True, colour="blue") as pbar:
                 current_file = None
                 for output_line in process.stdout:
                     match = self.progress_regex.search(output_line)
@@ -772,6 +788,12 @@ def decrypt_aes_cbc_128(encoded_message, password):
     result = decrypted_message[:-padding_length]
     return result.decode('latin-1')
 
+def is_destination_valid(path):
+    if os.access(path, os.W_OK):
+        return True
+    else:
+        return False
+
 # connect to ftp server and create a file index
 def get_ftp_file_index(ftp_host, ftp_port, ftp_user, ftp_pass, ftp_path, proxy, release_name):
     print(f" \033[93;1mGet FTP-Index for:\033[0m \033[95;1m{release_name}\033[0m")
@@ -807,6 +829,11 @@ def main(ftp_host, ftp_port, ftp_user, ftp_pass, ftp_path, destination, max_thre
         total_bytes = 0
         for file_info in files:
             total_bytes += file_info[1]
+        
+        if __printdebug__:
+            print(f" \033[93;1mFiles:\033[0m")
+            for file in files:
+                print(f" \033[93;1mFile: {file}\033[0m")
         
         # check for write premission
         if os.access(destination, os.W_OK):
@@ -848,9 +875,10 @@ if __name__ == "__main__":
     printBanner()
     
     parser = argparse.ArgumentParser(description=f'''pySFDLSauger {__version__} (GrafSauger)
-    Example: pySFDLSauger.py --sfdl /home/user/downloads/my.sfdl
-    Example: pySFDLSauger.py --sfdl https://download.schnuffy.net/enc/00000000;MyRelease.action.movie.3033-SAUGER
-    Example: pySFDLSauger.py --sfdl C:/downloads/my.sfdl --destination C:/downloads --threads 10''', formatter_class=argparse.RawDescriptionHelpFormatter)
+    Example: pySFDLSauger.py -i /home/user/downloads/my.sfdl
+    Example: pySFDLSauger.py -i https://download.schnuffy.net/enc/00000000;MyRelease.action.movie.3033-SAUGER
+    Example: pySFDLSauger.py --sfdl C:/downloads/my.sfdl --destination C:/downloads --threads 10
+    Example: pySFDLSauger.py -i C:/test.sfdl -d C:/downloads -t 3 --exclude ".scr, .vbs, sample, proof, .sub, .idx"''', formatter_class=argparse.RawDescriptionHelpFormatter)
     
     parser.add_argument("-i", "--sfdl", help="SFDL File")
     parser.add_argument("-d", "--destination", help="Download destination")
@@ -862,6 +890,7 @@ if __name__ == "__main__":
     parser.add_argument("--proxy_port", help="Socks5 Port")
     parser.add_argument("--proxy_user", help="Socks5 Username")
     parser.add_argument("--proxy_pass", help="Socks5 Password")
+    parser.add_argument("--exclude", help="Exlude files from download (default: '.scr, .vbs')")
     parser.add_argument("--debug", help="Debug (default: None)")
     
     args = parser.parse_args()
@@ -873,6 +902,10 @@ if __name__ == "__main__":
     monitor = args.monitor if args.monitor is not None else None
     
     __use_unrar__ = None if args.unrar is not None else True
+    
+    # files to exlucde from download
+    exclude_list = None if args.exclude is not None else '.scr, .vbs'
+    __exclude_files__ = [name.strip().lower() for name in exclude_list.split(",")]
     
     proxy_host = args.proxy_host if args.proxy_host is not None else None
     proxy_port = args.proxy_port if args.proxy_port is not None else None
@@ -950,6 +983,13 @@ if __name__ == "__main__":
         print(f"proxy_user: {proxy_user}")
         print(f"proxy_pass: {proxy_pass}")
         print("===== DEBUG ====")
+
+    if is_destination_valid(destination) == False:
+        print(f" \033[91;1mError: Unable to access or write to {destination}\033[0m")
+        print("\033[1;97m") # white bold text
+        parser.print_help()
+        print("\033[0m") # default text
+        sys.exit(1)
 
     if all(variable is not None for variable in [ftp_host, ftp_port, ftp_path]):
         main(ftp_host, int(ftp_port), ftp_user, ftp_pass, ftp_path, destination, int(threads), release_name, proxy, sfdl)
