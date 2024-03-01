@@ -1,4 +1,4 @@
-FROM python:3.12
+FROM python:slim-bookworm
 WORKDIR /pySFDLSauger
 COPY requirements.txt ./
 COPY pySFDLSauger.py ./
