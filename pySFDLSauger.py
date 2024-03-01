@@ -11,12 +11,13 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from concurrent.futures import ThreadPoolExecutor
 
-__version__ = "2.1.5"
+__version__ = "2.1.6"
 __printdebug__ = False
 __download_running__ = False
 __monitor_mode__ = False
 __use_unrar__ = None
 __exclude_files__ = []
+__update_url__ = "https://raw.githubusercontent.com/DoctorW00/pySFDLSauger/main/pySFDLSauger.py"
 
 class Proxy:
     def __init__(self, host, port, username=None, password=None):
@@ -609,6 +610,19 @@ class RarExtractor:
         self.file_info_regex = re.compile(r'Extracting from (.+)')
         self.saugerDesign = "\033[93;1m{desc}\033[0m \033[93;1m{percentage:3.0f}%\033[0m \033[93;1m|\033[0m{bar}\033[93;1m|\033[0m \033[93;1m{n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]\033[0m"
 
+    def list_subdirectories(self, root_path):
+        subdirectories = []
+        subdirectories.append(root_path)
+        def _list_subdirectories_recursive(current_path):
+            nonlocal subdirectories
+            for item in os.listdir(current_path):
+                item_path = os.path.join(current_path, item)
+                if os.path.isdir(item_path):
+                    subdirectories.append(item_path)
+                    _list_subdirectories_recursive(item_path)
+        _list_subdirectories_recursive(root_path)
+        return subdirectories
+
     def find_all_rar_files(self, folder_path):
         rar_regex = re.compile(r'^(.*?)(?:\.part\d*\.rar|\.r\d{2,}|\.[s-z]\d{2,}|\d+\.rar)$', re.IGNORECASE)
         rar_files = [file for file in os.listdir(folder_path) if rar_regex.match(file)]
@@ -642,50 +656,106 @@ class RarExtractor:
             return False
 
     def extract_rar(self):
-        allRARFiles = self.find_all_rar_files(self.rar_path)
-        firstRAR = self.find_rar_file(self.rar_path)
-        if firstRAR is None:
-            if __printdebug__: print(f" \033[91;1mUnRAR: No RAR file found in {self.rar_path}\033[0m")
-            return False
-        
-        try:
-            if not self.is_unrar_available():
-                raise Exception(f" \033[91;1mUnRAR error: Can\'t find UnRAR executable! Please install UnRAR first!\033[0m")
-
-            command = ['unrar', 'x', '-o+', firstRAR, self.extract_path]
-            if self.password:
-                command.extend(['-p' + self.password])
-
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+        rar_errors = 0
+        allsubfolders = self.list_subdirectories(self.rar_path)
+        for folder in allsubfolders:
             
-            with tqdm.tqdm(total=100, dynamic_ncols=True, bar_format=self.saugerDesign, desc=f' \033[93;1mUnRAR files ...\033[0m', unit='%', position=0, leave=True, colour="blue") as pbar:
-                current_file = None
-                for output_line in process.stdout:
-                    match = self.progress_regex.search(output_line)
-                    file_match = self.file_info_regex.search(output_line)
+            print(f" \033[93;1mUnRAR enter dir:\033[0m \033[92m{folder}\033[0m")
+            
+            allRARFiles = self.find_all_rar_files(folder)
+            firstRAR = self.find_rar_file(folder)
+            
+            if firstRAR is None:
+                if __printdebug__: print(f" \033[91;1mUnRAR: No RAR file found in {folder}\033[0m")
+                rar_errors += 1
+                pass
+            
+            try:
+                if not self.is_unrar_available():
+                    raise Exception(f" \033[91;1mUnRAR error: Can\'t find UnRAR executable! Please install UnRAR first!\033[0m")
 
-                    if match:
-                        percent = int(match.group(1))
-                        pbar.update(percent - pbar.n)
-                    elif file_match:
-                        current_file = os.path.basename(file_match.group(1))
-                        pbar.set_description(f' \033[93;1mUnRAR\033[0m \033[91;1m{current_file}\033[0m')
+                command = ['unrar', 'x', '-o+', firstRAR, folder]
+                if self.password:
+                    command.extend(['-p' + self.password])
 
-                if 'All OK' in output_line:
-                    pbar.update(100 - pbar.n)
+                process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+                
+                with tqdm.tqdm(total=100, dynamic_ncols=True, bar_format=self.saugerDesign, desc=f' \033[93;1mUnRAR files ...\033[0m', unit='%', position=0, leave=True, colour="blue") as pbar:
+                    current_file = None
+                    for output_line in process.stdout:
+                        match = self.progress_regex.search(output_line)
+                        file_match = self.file_info_regex.search(output_line)
 
-            process.wait()
+                        if match:
+                            percent = int(match.group(1))
+                            pbar.update(percent - pbar.n)
+                        elif file_match:
+                            current_file = os.path.basename(file_match.group(1))
+                            pbar.set_description(f' \033[93;1mUnRAR\033[0m \033[91;1m{current_file}\033[0m')
 
-            if 'All OK' not in output_line:
-                print(f" \033[91;1mUnRAR error: ALL OK message NOT found!\033[0m")
-                return False
-            else:
-                if __printdebug__: print(f" \033[93;1mUnRAR ALL OK ... remvoing RAR files ...\033[0m")
-                self.delete_rar_files(allRARFiles)
-                return True
-        except Exception as e:
-            print(f" \033[91;1mUnRAR error: {e}\033[0m")
+                    if 'All OK' in output_line:
+                        pbar.update(100 - pbar.n)
+
+                process.wait()
+
+                if 'All OK' not in output_line:
+                    print(f" \033[91;1mUnRAR error: ALL OK message NOT found!\033[0m")
+                    rar_errors += 1
+                    pass
+                else:
+                    if __printdebug__: print(f" \033[93;1mUnRAR ALL OK ... remvoing RAR files ...\033[0m")
+                    self.delete_rar_files(allRARFiles)
+                    pass
+            except Exception as e:
+                print(f" \033[91;1mUnRAR error: {e}\033[0m")
+                rar_errors += 1
+                pass
+        
+        if rar_errors:
             return False
+        else:
+            return True
+
+class ScriptUpdater:
+    def __init__(self, script_url, local_version=None):
+        self.script_url = script_url
+        self.local_version = local_version
+        self.local_script_path = os.path.join(os.path.dirname(__file__), script_url.split("/")[-1])
+
+    def check_for_update(self):
+        try:
+            response = requests.get(self.script_url, stream=True)
+            response.raise_for_status()
+            if response.status_code == 200:
+                remote_version = re.search(r'__version__ = "([0-9.]+)"', response.text)
+                if remote_version:
+                    remote_version = remote_version.group(1)
+                    if self.local_version is None or remote_version > self.local_version:
+                        print(f" \033[93;1mThis version: \033[91;1m{self.local_version}\033[0m\033[93;1m, latest version\033[0m \033[92m{remote_version}.\033[0m")
+                        update_choice = input(" \033[93;1mLoad update now? (y/n):\033[0m ").lower()
+                        if update_choice in ['y', 'z', 'j']:
+                            self._update_script(response)
+                        else:
+                            print(" \033[93;1mUpdate canceled.\033[0m")
+                    else:
+                        print(" \033[93;1mNo new version available. This version is up to date!\033[0m")
+                else:
+                    print(" \033[93;1mUnable to find version number.\033[0m")
+            else:
+                print(f" \033[91;1mUnable to access GitHub: {response.status_code}\033[0m")
+        except requests.exceptions.RequestException as e:
+            print(f" \033[91;1mUpdate request error: {e}\033[0m")
+        except Exception as e:
+            print(f" \033[91;1mUnknown update error: {e}\033[0m")
+
+    def _update_script(self, response):
+        try:
+            with open(self.local_script_path, "wb") as local_file:
+                for chunk in response.iter_content(chunk_size=128):
+                    local_file.write(chunk)
+            print(" \033[93;1mSuccessfully updated!\033[0m")
+        except Exception as e:
+            print(f" \033[91;1mUpdate error, unable to write file: {e}\033[0m")
 
 def bytes2human(byte_size, base=1024):
     if byte_size == 0:
@@ -698,36 +768,40 @@ def bytes2human(byte_size, base=1024):
 def readSFDL(sfdl_file, password):
     sfdl_data = {}
     
-    root = ET.fromstring(sfdl_file)
+    try:
+        root = ET.fromstring(sfdl_file)
+        encrypted = root.find('Encrypted').text
+        release_name = root.find('Description').text
+        connection_info = root.find('ConnectionInfo')
 
-    encrypted = root.find('Encrypted').text
-    release_name = root.find('Description').text
-    
-    connection_info = root.find('ConnectionInfo')
-    
-    if connection_info is not None:
-        ftp_host = connection_info.find('Host').text if connection_info.find('Host') is not None else None
-        ftp_port = connection_info.find('Port').text if connection_info.find('Port') is not None else None
-        ftp_user = connection_info.find('Username').text if connection_info.find('Username') is not None else None
-        ftp_pass = connection_info.find('Password').text if connection_info.find('Password') is not None else None
-        ftp_path = connection_info.find('BulkFolderPath').text if connection_info.find('BulkFolderPath') is not None else None
+        if connection_info is not None:
+            ftp_host = connection_info.find('Host').text if connection_info.find('Host') is not None else None
+            ftp_port = connection_info.find('Port').text if connection_info.find('Port') is not None else None
+            ftp_user = connection_info.find('Username').text if connection_info.find('Username') is not None else None
+            ftp_pass = connection_info.find('Password').text if connection_info.find('Password') is not None else None
+            ftp_path = connection_info.find('BulkFolderPath').text if connection_info.find('BulkFolderPath') is not None else None
 
-    ftp_path = root.find('Packages/SFDLPackage/BulkFolderList/BulkFolder/BulkFolderPath').text if root.find('Packages/SFDLPackage/BulkFolderList/BulkFolder/BulkFolderPath') is not None else None
-    
-    if encrypted == 'true':
-        release_name = decrypt_aes_cbc_128(release_name, password)
-        ftp_host = decrypt_aes_cbc_128(ftp_host, password)
-        ftp_user = decrypt_aes_cbc_128(ftp_user, password)
-        ftp_pass = decrypt_aes_cbc_128(ftp_pass, password)
-        ftp_path = decrypt_aes_cbc_128(ftp_path, password)
+        # ftp_paths = ftp_paths or [item.text for item in root.findall('Packages/SFDLPackage/BulkFolderList/BulkFolder/BulkFolderPath')]
+        ftp_path = root.find('Packages/SFDLPackage/BulkFolderList/BulkFolder/BulkFolderPath').text if root.find('Packages/SFDLPackage/BulkFolderList/BulkFolder/BulkFolderPath') is not None else None
+
+        if encrypted == 'true':
+            release_name = decrypt_aes_cbc_128(release_name, password)
+            ftp_host = decrypt_aes_cbc_128(ftp_host, password)
+            ftp_user = decrypt_aes_cbc_128(ftp_user, password)
+            ftp_pass = decrypt_aes_cbc_128(ftp_pass, password)
+            ftp_path = decrypt_aes_cbc_128(ftp_path, password)
         
-    sfdl_data['release_name'] = release_name
-    sfdl_data['ftp_host'] = ftp_host
-    sfdl_data['ftp_port'] = ftp_port
-    sfdl_data['ftp_user'] = ftp_user
-    sfdl_data['ftp_pass'] = ftp_pass
-    sfdl_data['ftp_path'] = ftp_path
-    
+        sfdl_data['release_name'] = release_name
+        sfdl_data['ftp_host'] = ftp_host
+        sfdl_data['ftp_port'] = ftp_port
+        sfdl_data['ftp_user'] = ftp_user
+        sfdl_data['ftp_pass'] = ftp_pass
+        sfdl_data['ftp_path'] = ftp_path
+
+    except Exception as e:
+        print(f" \033[91;1m SFDL read error: {e}\033[0m")
+        return None
+
     if sfdl_data:
         return sfdl_data
     else:
@@ -778,6 +852,8 @@ def getSFDL(url, form_data=None):
 
 # decrypt sfdl
 def decrypt_aes_cbc_128(encoded_message, password):
+    if not encoded_message:
+        return None
     decoded_message = base64.b64decode(encoded_message)
     iv = decoded_message[:16]
     key = hashlib.md5(password.encode('latin-1')).digest()
@@ -890,10 +966,18 @@ if __name__ == "__main__":
     parser.add_argument("--proxy_port", help="Socks5 Port")
     parser.add_argument("--proxy_user", help="Socks5 Username")
     parser.add_argument("--proxy_pass", help="Socks5 Password")
-    parser.add_argument("--exclude", help="Exlude files from download (default: '.scr, .vbs')")
+    parser.add_argument("--exclude", help="Exclude files from download (default: '.scr, .vbs')")
+    parser.add_argument("--update", help="Check and load new pySFDLSauger.py from GitHub")
     parser.add_argument("--debug", help="Debug (default: None)")
     
     args = parser.parse_args()
+
+    update = args.update if args.update is not None else None
+    if update is not None:
+        print(f" \033[93;1mChecking for updates ...\033[0m")
+        updater = ScriptUpdater(__update_url__, __version__)
+        updater.check_for_update()
+        sys.exit(0)
 
     sfdl = args.sfdl if args.sfdl is not None else None
     destination = args.destination if args.destination is not None else None
