@@ -4,3 +4,4 @@ cryptography
 urllib3
 PySocks
 watchdog
+flask
