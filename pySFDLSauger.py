@@ -14,7 +14,7 @@ from io import BytesIO
 from zipfile import ZipFile
 from flask import Flask, render_template_string
 
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 __printdebug__ = False
 __download_running__ = False
 __monitor_mode__ = False
@@ -1345,6 +1345,13 @@ if __name__ == "__main__":
         else:
             destination = os.getcwd()
 
+    if is_destination_valid(destination) == False:
+        print(f" \033[91;1mError: Unable to access or write to {destination}\033[0m")
+        print("\033[1;97m") # white bold text
+        parser.print_help()
+        print("\033[0m") # default text
+        sys.exit(1)
+
     # set socks5 proxy
     proxy = None
     if proxy_host is not None and proxy_port is not None:
@@ -1378,41 +1385,41 @@ if __name__ == "__main__":
         # add monitor service
         if monitor is None:
             monitor = destination
-        # watchdog_thread = threading.Thread(target=start_watchdog, args=(monitor, password, destination, 2))
-        # watchdog_thread.daemon = True
-        # watchdog_thread.start()
         __file_watcher_thread__ = threading.Thread(target=start_watchdog, args=(monitor, password, destination, threads))
         __file_watcher_thread__.daemon = True
         __file_watcher_thread__.start()
         
         while True:
             time.sleep(1)
-    
+
     # start watchdog service to monitor path for new sfdl files
     if monitor is not None:
         watchdog_thread = threading.Thread(target=start_watchdog, args=(monitor, password, destination, threads))
         watchdog_thread.daemon = True
         watchdog_thread.start()
-    
-    if sfdl is None and www_gui is None:
+        
+        while True:
+            time.sleep(1)
+
+    if sfdl is None:
         print(" \033[91;1mError: No SFDL file set!\033[0m")
         print("\033[1;97m") # white bold text
         parser.print_help()
         print("\033[0m") # default text
         sys.exit(1)
-    else:
-        if www_gui is None and sfdl is not None:
-            # get SFDL file data from web or local file
-            sfdl_file = getSFDL(sfdl)
-            sfdl_data = readSFDL(sfdl_file, password)
-            release_name, ftp_host, ftp_port, ftp_user, ftp_pass, ftp_path = (None, None, None, None, None, None)
-            if sfdl_data is not None:
-                release_name = sfdl_data['release_name']
-                ftp_host = sfdl_data['ftp_host']
-                ftp_port = sfdl_data['ftp_port']
-                ftp_user = sfdl_data['ftp_user']
-                ftp_pass = sfdl_data['ftp_pass']
-                ftp_path = sfdl_data['ftp_path']
+        
+    if sfdl is not None:
+        # get SFDL file data from web or local file
+        sfdl_file = getSFDL(sfdl)
+        sfdl_data = readSFDL(sfdl_file, password)
+        release_name, ftp_host, ftp_port, ftp_user, ftp_pass, ftp_path = (None, None, None, None, None, None)
+        if sfdl_data is not None:
+            release_name = sfdl_data['release_name']
+            ftp_host = sfdl_data['ftp_host']
+            ftp_port = sfdl_data['ftp_port']
+            ftp_user = sfdl_data['ftp_user']
+            ftp_pass = sfdl_data['ftp_pass']
+            ftp_path = sfdl_data['ftp_path']
 
     if __printdebug__:
         print("===== DEBUG ====")
@@ -1430,13 +1437,6 @@ if __name__ == "__main__":
         print(f"proxy_user: {proxy_user}")
         print(f"proxy_pass: {proxy_pass}")
         print("===== DEBUG ====")
-
-    if is_destination_valid(destination) == False:
-        print(f" \033[91;1mError: Unable to access or write to {destination}\033[0m")
-        print("\033[1;97m") # white bold text
-        parser.print_help()
-        print("\033[0m") # default text
-        sys.exit(1)
 
     if www_gui is None:
         if all(variable is not None for variable in [ftp_host, ftp_port, ftp_path]):
