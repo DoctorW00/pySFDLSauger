@@ -14,7 +14,7 @@ from io import BytesIO
 from zipfile import ZipFile
 from flask import Flask, render_template_string
 
-__version__ = "2.2.1"
+__version__ = "2.2.2"
 __printdebug__ = False
 __download_running__ = False
 __monitor_mode__ = False
@@ -223,7 +223,7 @@ class FTPDownloader:
         speedreport = path + '/speedreport.txt'
         try:
             with open(speedreport, 'w') as file:
-                file.write(f'Speedreport: [B]{line1}[/B]\n')
+                file.write(f'[B]{line1}[/B]\n')
                 file.write('[HR][/HR]\n')
                 file.write(f'{line2}\n')
                 file.write(f'Thanks! :lv6:\n')
@@ -424,7 +424,7 @@ class FTPDownloader:
             if __use_web_gui__: add_weg_gui_log(f'Download completed in {elapsed_time} ({speed}/s)')
             
             # create speedreport in download folder
-            self.write_speedreport(self.local_download_path, self.release_name, f'Downloaded {total_files} files in {elapsed_time} ({speed}/s)')
+            self.write_speedreport(self.local_download_path, self.release_name, f'Downloaded {total_files} ({bytes2human(total_size, 1000)}) files in {elapsed_time} ({speed}/s)')
             
             # use UnRAR to rextract RAR archives
             if __use_unrar__ is not None:
