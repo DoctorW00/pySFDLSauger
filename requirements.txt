@@ -3,5 +3,6 @@ requests
 cryptography
 urllib3
 PySocks
+websockets
 watchdog
 flask
